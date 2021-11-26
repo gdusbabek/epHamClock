@@ -15,6 +15,10 @@ Epaper Ham Clock
 3. [TinyGps+](http://arduiniana.org/libraries/tinygpsplus/)
 4. [maidenhead](https://www.arduino.cc/reference/en/libraries/maidenhead/)
 
+## Notes
+
+<b>DO NOT USE DIGITAL PIN 4</b> for the temperature sensor or anything else. Some weird interplay there was causing I2C to freeze. Moving off that pin fixed the problem.
+
 
 
 
