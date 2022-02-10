@@ -1,45 +1,46 @@
-#define ONEWIRE_SEARCH 0
+ #define ONEWIRE_SEARCH 0
 
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
-
 #include <SPI.h>
+#include <DS18B20.h>
+#include <maidenhead.h>
+
 #include <epd2in9_V2.h>
 #include <epdif.h>
-//
 #include <epdpaint.h>
 #include <fonts.h>
 #include <imagedata.h>
 
-#include <maidenhead.h>
-
-#include <DS18B20.h>
-
-
-#define COLORED     0
-#define UNCOLORED   1
-
-#define BLINK_DELAY 100
-#define GPS_RX_PIN 2
-#define GPS_TX_PIN 3
-#define ONEWIRE_PIN 6
-#define LED_PIN 5
-#define MAX_TEMP_TRIES 100
+#define COLORED           0
+#define UNCOLORED         1
+#define GPS_TX_ARD_RX     3 
+#define GPS_RX_ARD_TX     2
+#define ONEWIRE_PIN       6
+#define MAX_TEMP_ATTEMPTS    100
+#define GPS_LOCK_TIMEOUT  10000
+#define GPS_STATE_FRESH   1
+#define GPS_STATE_STALE   2
+#define GPS_STATE_LOST    3
 
 
-// Create a TinyGPS++ object
+// GPS stuff.
 TinyGPSPlus gps;
+SoftwareSerial gpsSerial(GPS_TX_ARD_RX, GPS_RX_ARD_TX);
+unsigned long gpsState = GPS_STATE_LOST;
+unsigned long gpsLastRead = 0;
 
-// Create a software serial port called "gpsSerial"
-SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN);
-
-// temperature sensor
+// temperature stuff.
 DS18B20 ds(ONEWIRE_PIN);
+float curTemp = 0.0;
 
-// GPS fields.
-unsigned long lastGpsRead = 0;
-unsigned long lastPaint = 0;
-unsigned long lastFix = 0;
+// Epaper stuff.
+unsigned char image[1024];
+Paint paint(image, 0, 0);    // width should be the multiple of 8 
+Epd display;
+boolean epdOk = false;
+
+// display fields
 char loc[20] = "00.0000N, 000.0000W\0";
 char alt[20] = "+000000 ft, 00 sats        \0";
 char time[22] = "HH:MM:SS UTC         \0";
@@ -47,189 +48,64 @@ char date[18] = "00/00/0000       \0";
 char NO_READING[11] = "NO READING\0";
 char NO_GPS[7] = "NO GPS\0";
 char STALE[6] = "STALE\0";
-float curTemp = 0.0;
 
-// epaper stuff
-boolean recentGpsData = false;
-unsigned char image[1024];
-Paint paint(image, 0, 0);    // width should be the multiple of 8 
-Epd display;
-boolean displayOk = true;
-
-
-// blinks for a few ms.
-void blink(unsigned long millis) {
-  boolean on = true;
-  for (int i = 0; i < millis; i+= BLINK_DELAY) {
-    digitalWrite(LED_PIN, on);
-    safeDelay(BLINK_DELAY);
-    on = !on;
-  }
-  digitalWrite(LED_PIN, LOW);
-}
-
-// consumes GPS for maximum of ms.
-// may return earlier.
-void pollGps(unsigned long ms) {
-  unsigned long start = millis();
-  while (millis() - start && gpsSerial.available()) {
-    if (gps.encode(gpsSerial.read())) {
-      recentGpsData = true;
-      lastGpsRead = millis();
-    }
-  }
-}
-
-// tries to get the temperature.
-// be warned: this guy takes about 1 second to run.
-float pollTemp() {
-  curTemp = 0.0; // small race here.
-  for (int i = 0; i < MAX_TEMP_TRIES; i++) {
-    if (ds.selectNext()) {
-      curTemp = ds.getTempF();
-      break;
-    }
-  }
-  if (curTemp == 0.0) {
-    Serial.println(F("Failed temp"));
-  }
-}
-
-// busy loop that aggressively consumes gps data for a period of time.
-// similar to pollGps(), but will never return sooner than ms.
-void safeDelay(unsigned long ms) {
-  unsigned long start = millis();
-  do {
-    pollGps(ms - (millis() - start));
-  } while (millis() - start < ms);
-}
-
-void setup()
-{
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+void setup() {
   Serial.begin(9600);
   analogReference(EXTERNAL);
   gpsSerial.begin(9600);
+  Serial.println(F("Serial devices initialized"));
 
-  // initialize the display.
+  // initialize waveshare display
   if (display.Init() != 0) {
-    displayOk = false;
+    Serial.println(F("EPD initialization failed"));
   } else {
-    updateFields();
+    Serial.println(F("EPD ok"));
+    epdOk = true;
+    updateValues();
     display.ClearFrameMemory(0xFF);
     display.DisplayFrame();
     repaintScreen();
   }
 }
 
-void loop()
-{
-  // populate gps stuff.
-  safeDelay(1000);
+void loop() {
+  Serial.println(F("Loop"));
+  
+  // reset fresh check and poll gps
+  gpsState = GPS_STATE_STALE;
+  safeDelay(9000);
 
-  // populate temperature.
-  // this call usually takes about 1s, so it has the effect of making the LED blink for
-  // about a second.
-  digitalWrite(LED_PIN, true);
+  // die if GPS never warmed up.
+  if (millis() > 5000 && gps.charsProcessed() < 10) {
+    Serial.println(F("No GPS detected: check wiring."));
+    // TODO: turn on both lights.
+    while(true);
+  }
+
+  unsigned long loopStart = millis();
+
+  // see if we've lost our gps lock
+  if (loopStart - gpsLastRead > GPS_LOCK_TIMEOUT) {
+    gpsState = GPS_STATE_LOST;
+  }
+
   pollTemp();
-  digitalWrite(LED_PIN, false);
 
-  // maybe repaint.
-  // give visual indication if it's stale.
-  if (millis() - lastPaint > 10000) {
-    // one last chance to get some gps data.
-    if (!recentGpsData) {
-      safeDelay(1000);
-    }
-    
-    // if we still don't have data, give a visual indication.
-    // we've lost our fix.
-    if (!recentGpsData) {
-      blink(1500);
-    }
-    
-    // if we have gps data, update fields and toggle the recency flag
-    // otherwise, indicate in the alt field.
-    if (recentGpsData) {
-      updateFields();
-      recentGpsData = false;
-    } else {
-      strcpy(alt, STALE);
-    }
-    repaintScreen();
-    lastPaint = millis();
-  }
+  updateValues();
+  repaintScreen();
 }
 
-void repaintScreen() {
-  if (displayOk) {
-    paint.SetRotate(ROTATE_90);
-    paint.SetWidth(24);
-    paint.SetHeight(295);
-    
-    paint.Clear(UNCOLORED);
-    paint.DrawStringAt(0, 0, loc, &Font20, COLORED);
-    display.SetFrameMemory(paint.GetImage(), 100, 0, paint.GetWidth(), paint.GetHeight());
+void updateValues() {
+  int bufPos = 0; // pointer.
 
-    paint.Clear(UNCOLORED);
-    paint.DrawStringAt(0, 0, time, &Font24, COLORED);
-    display.SetFrameMemory(paint.GetImage(), 68, 0, paint.GetWidth(), paint.GetHeight());
-
-    paint.Clear(UNCOLORED);
-    paint.DrawStringAt(0, 0, date, &Font20, COLORED);
-    display.SetFrameMemory(paint.GetImage(), 34, 0, paint.GetWidth(), paint.GetHeight());
-
-    paint.Clear(UNCOLORED);
-    paint.DrawStringAt(0, 0, alt, &Font12, COLORED);
-    display.SetFrameMemory(paint.GetImage(), 0, 0, paint.GetWidth(), paint.GetHeight());
-
-    display.DisplayFrame();
-  }
-}
-
-// returns the number of digits in a double, assuming 4 digits of precision.
-// doesn't work if l is >= 1k.
-int numDigitsDouble(double l) {
-  if (l < 10.0) {
-    return 6;
-  } else if (l < 100.0) {
-    return 7;
-  } else {
-    return 8;
-  }
-}
-
-// returns the number of digits for a double that gets converted to an integer.
-// it's used for altitude, so assume a max of 5 digits.
-int numDigitsInt(double d) {
-  if (d < 10.0) {
-    return 1;
-  } else if (d < 100.0) {
-    return 2;
-  } else if (d < 1000.0) {
-    return 3;
-  } else if (d < 10000.0) {
-    return 4;
-  } else {
-    return 5; // it's for altitude. this is as big as it gets.
-  }
-}
-
-// update the memory fields for the various sensor objects.
-// there is some clumsy pointer manipulation here that could 
-// be cleaned up quite a bit by someone who knows C.
-void updateFields()
-{
-  // copy the location. 
-  int bufPos = 0;
-  if (gps.location.isValid()) {
+  // gps data
+  if (gpsState == GPS_STATE_FRESH && gps.location.isValid()) {
     dtostrf(abs(gps.location.lat()), -1, 4, loc + bufPos);
     bufPos += numDigitsDouble(abs(gps.location.lat()));
     loc[bufPos++] = gps.location.lat() < 0.0 ? 'S' : 'N';
     loc[bufPos++] = ',';
     loc[bufPos++] = ' ';
-    dtostrf(abs(gps.location.lng()), -1, 4, loc + bufPos);
+    dtostrf(abs(gps.location.lng()), 01, 4, loc + bufPos);
     bufPos += numDigitsDouble(abs(gps.location.lng()));
     loc[bufPos++] = gps.location.lng() < 0 ? 'W' : 'E';
     loc[bufPos++] = '\0';
@@ -237,9 +113,8 @@ void updateFields()
     strcpy(loc, NO_READING);
   }
 
-  // copy the time.
-  // hour
-  if (gps.time.isUpdated()) {
+  // time and temperature.
+  if (gpsState == GPS_STATE_FRESH && gps.time.isUpdated()) {
     bufPos = 0;
     if (gps.time.hour() < 10) {
       time[bufPos++] = '0';
@@ -279,14 +154,12 @@ void updateFields()
     bufPos += numDigitsInt(curTemp);
     time[bufPos++] = 'F';
     time[bufPos++] = '\0';
-  } else if (!gps.time.isValid()) {
-    strcpy(time, NO_GPS);
   } else if (gps.time.age() > 30000) {
     strcpy(time, NO_READING);
   }
 
-  // copy the date.
-  if (gps.date.isUpdated()) {
+  // date
+  if (gpsState == GPS_STATE_FRESH && gps.date.isUpdated()) {
     bufPos = 0;
     // month
     if (gps.date.month() < 10) {
@@ -325,10 +198,8 @@ void updateFields()
     strcpy(date, NO_READING);
   }
 
-  // alt + sats
-  if (!gps.altitude.isValid()) {
-    strcpy(alt, NO_GPS);
-  } else if (gps.altitude.isUpdated()) {
+  // altitude + sats
+  if (gpsState == GPS_STATE_FRESH && gps.altitude.isValid()) {
     bufPos = 0;
     if (gps.altitude.feet() < 0.0) {
       alt[bufPos++] = '-';
@@ -353,5 +224,131 @@ void updateFields()
   } else {
     strcpy(alt, NO_READING);
   }
-//    lastFix = gps.time.age();
+  
+}
+
+void repaintScreen() {
+  if (epdOk) {
+    paint.SetRotate(ROTATE_90);
+    paint.SetWidth(24);
+    paint.SetHeight(295);
+
+    // location.
+    paint.Clear(UNCOLORED);
+    paint.DrawStringAt(0, 0, loc, &Font20, COLORED);
+    display.SetFrameMemory(paint.GetImage(), 100, 0, paint.GetWidth(), paint.GetHeight());
+
+    // time.
+    paint.Clear(UNCOLORED);
+    paint.DrawStringAt(0, 0, time, &Font24, COLORED);
+    display.SetFrameMemory(paint.GetImage(), 68, 0, paint.GetWidth(), paint.GetHeight());
+
+    // date
+    paint.Clear(UNCOLORED);
+    paint.DrawStringAt(0, 0, date, &Font20, COLORED);
+    display.SetFrameMemory(paint.GetImage(), 34, 0, paint.GetWidth(), paint.GetHeight());
+
+    // altitude
+    paint.Clear(UNCOLORED);
+    paint.DrawStringAt(0, 0, alt, &Font12, COLORED);
+    display.SetFrameMemory(paint.GetImage(), 0, 0, paint.GetWidth(), paint.GetHeight());
+
+    display.DisplayFrame();
+  }
+}
+
+// tries to get the temperature.
+// be warned: this guy takes about 1 second to run.
+float pollTemp() {
+  curTemp = 0.0; // small race here.
+  for (int i = 0; i < MAX_TEMP_ATTEMPTS; i++) {
+    if (ds.selectNext()) {
+      curTemp = ds.getTempF();
+      break;
+    }
+  }
+  if (curTemp == 0.0) {
+    Serial.println(F("Failed temp"));
+  }
+}
+
+
+void safeDelay(unsigned long ms) {
+  unsigned long start = millis();
+  do {
+    _pollGps(ms - millis() + start);
+  } while (millis() - start < ms);
+}
+
+void _pollGps(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms && gpsSerial.available()) {
+    if (gps.encode(gpsSerial.read())) {
+      gpsState = GPS_STATE_FRESH;
+      gpsLastRead = millis();
+    }
+  }
+}
+
+// returns the number of digits in a double, assuming 4 digits of precision.
+// doesn't work if l is >= 1k.
+int numDigitsDouble(double l) {
+  if (l < 10.0) {
+    return 6;
+  } else if (l < 100.0) {
+    return 7;
+  } else {
+    return 8;
+  }
+}
+
+// returns the number of digits for a double that gets converted to an integer.
+// it's used for altitude, so assume a max of 5 digits.
+int numDigitsInt(double d) {
+  if (d < 10.0) {
+    return 1;
+  } else if (d < 100.0) {
+    return 2;
+  } else if (d < 1000.0) {
+    return 3;
+  } else if (d < 10000.0) {
+    return 4;
+  } else {
+    return 5; // it's for altitude. this is as big as it gets.
+  }
+}
+
+void _dumpGps() {
+  Serial.print(F("LAT : ")); Serial.println(gps.location.lat(), 6); // Latitude in degrees (double)
+  Serial.print(F("LON : "));Serial.println(gps.location.lng(), 6); // Longitude in degrees (double)
+  Serial.print(F("RLAT: "));Serial.print(gps.location.rawLat().negative ? "-" : "+");
+  Serial.println(gps.location.rawLat().deg); // Raw latitude in whole degrees
+//  Serial.println(gps.location.rawLat().billionths);// ... and billionths (u16/u32)
+  Serial.print(F("RLON: "));Serial.print(gps.location.rawLng().negative ? "-" : "+");
+  Serial.println(gps.location.rawLng().deg); // Raw longitude in whole degrees
+//  Serial.println(gps.location.rawLng().billionths);// ... and billionths (u16/u32)
+  Serial.print(F("DATE: "));Serial.println(gps.date.value()); // Raw date in DDMMYY format (u32)
+//  Serial.println(gps.date.year()); // Year (2000+) (u16)
+//  Serial.println(gps.date.month()); // Month (1-12) (u8)
+//  Serial.println(gps.date.day()); // Day (1-31) (u8)
+  Serial.print(F("TIME: "));Serial.println(gps.time.value()); // Raw time in HHMMSSCC format (u32)
+//  Serial.println(gps.time.hour()); // Hour (0-23) (u8)
+//  Serial.println(gps.time.minute()); // Minute (0-59) (u8)
+//  Serial.println(gps.time.second()); // Second (0-59) (u8)
+//  Serial.println(gps.time.centisecond()); // 100ths of a second (0-99) (u8)
+//  Serial.println(gps.speed.value()); // Raw speed in 100ths of a knot (i32)
+//  Serial.println(gps.speed.knots()); // Speed in knots (double)
+//  Serial.println(gps.speed.mph()); // Speed in miles per hour (double)
+//  Serial.println(gps.speed.mps()); // Speed in meters per second (double)
+//  Serial.println(gps.speed.kmph()); // Speed in kilometers per hour (double)
+//  Serial.println(gps.course.value()); // Raw course in 100ths of a degree (i32)
+//  Serial.println(gps.course.deg()); // Course in degrees (double)
+//  Serial.println(gps.altitude.value()); // Raw altitude in centimeters (i32)
+//  Serial.println(gps.altitude.meters()); // Altitude in meters (double)
+//  Serial.println(gps.altitude.miles()); // Altitude in miles (double)
+//  Serial.println(gps.altitude.kilometers()); // Altitude in kilometers (double)
+  Serial.print(F("ALT: "));Serial.println(gps.altitude.feet()); // Altitude in feet (double)
+  Serial.print(F("SATS: "));Serial.println(gps.satellites.value()); // Number of satellites in use (u32)
+  Serial.print(F("PREC: "));Serial.println(gps.hdop.value()); // Horizontal Dim. of Precision (100ths-i32)
+  Serial.println();
 }
